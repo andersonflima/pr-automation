@@ -1,0 +1,25 @@
+# Copie para .github/workflows/pr-flow.yml no repositório.
+# Pré-requisitos:
+# - GitHub App andersonflima-automation instalado na conta ou organização;
+# - variável AUTOMATION_APP_ID e segredo AUTOMATION_APP_PRIVATE_KEY disponíveis
+#   (de organização ou do repositório);
+# - auto-merge ligado no repositório (Settings → General → Allow auto-merge);
+# - proteção nas branches de integração e de promoção com os checks de CI
+#   obrigatórios.
+name: pr-flow
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+  push:
+    branches: [develop]
+
+jobs:
+  flow:
+    uses: andersonflima/pr-automation/.github/workflows/pr-flow.yml@v1
+    with:
+      app_id: ${{ vars.AUTOMATION_APP_ID }}
+      integration_branch: develop
+      promotion_branch: homolog
+    secrets:
+      app_private_key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}

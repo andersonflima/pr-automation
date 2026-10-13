@@ -1,0 +1,119 @@
+# Esteira de PR reutilizável.
+#
+# 1. auto-merge: PR de uma branch de trabalho (feature/*, feat/*, fix/*, ...)
+#    para a branch de integração recebe merge automático (squash) assim que os
+#    checks obrigatórios da proteção de branch passam.
+# 2. promote: cada push na branch de integração abre (ou reaproveita) o PR
+#    integração → promoção e liga o merge automático (merge commit, para manter
+#    a ancestralidade) quando os checks dele passam.
+#
+# As ações usam o token do GitHub App, não o GITHUB_TOKEN: um merge feito pelo
+# GITHUB_TOKEN não dispara outros workflows, e a cadeia (merge → PR de
+# promoção → checks → merge → deploy) pararia no primeiro passo.
+#
+# O merge automático depende de proteção de branch com checks obrigatórios na
+# branch de integração e na de promoção; sem isso o GitHub recusa o --auto.
+name: pr-flow
+
+on:
+  workflow_call:
+    inputs:
+      app_id:
+        description: ID do GitHub App que executa os merges.
+        type: string
+        required: true
+      integration_branch:
+        description: Branch que recebe as branches de trabalho (ex. develop).
+        type: string
+        required: true
+      promotion_branch:
+        description: Branch que recebe a integração (ex. homolog). Vazio desliga a promoção.
+        type: string
+        default: ""
+      work_branch_pattern:
+        description: Regex (ERE) dos nomes de branch com merge automático.
+        type: string
+        default: "^(feature|feat)/"
+      merge_method:
+        description: Método do merge das branches de trabalho (squash, merge ou rebase).
+        type: string
+        default: squash
+    secrets:
+      app_private_key:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  auto-merge:
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.base.ref == inputs.integration_branch &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Branch de trabalho?
+        id: match
+        env:
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          PATTERN: ${{ inputs.work_branch_pattern }}
+        run: |
+          if printf '%s' "$HEAD_REF" | grep -Eq "$PATTERN"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Branch $HEAD_REF fora do padrão $PATTERN; nada a fazer."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Token do App
+        if: steps.match.outputs.ok == 'true'
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ inputs.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+      - name: Ligar merge automático
+        if: steps.match.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PR: ${{ github.event.pull_request.number }}
+          METHOD: ${{ inputs.merge_method }}
+        run: gh pr merge "$PR" --repo "$GITHUB_REPOSITORY" --auto "--$METHOD" --delete-branch
+
+  promote:
+    if: >-
+      github.event_name == 'push' &&
+      inputs.promotion_branch != '' &&
+      github.ref_name == inputs.integration_branch
+    runs-on: ubuntu-latest
+    concurrency:
+      group: pr-flow-promote-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Token do App
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ inputs.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+      - name: Abrir ou reaproveitar o PR de promoção e ligar o merge automático
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BASE: ${{ inputs.promotion_branch }}
+          HEAD: ${{ inputs.integration_branch }}
+        run: |
+          ahead=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD" --jq '.ahead_by')
+          if [ "$ahead" = "0" ]; then
+            echo "$HEAD não tem nada à frente de $BASE."
+            exit 0
+          fi
+          pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base "$BASE" --head "$HEAD" --state open --json number --jq '.[0].number')
+          if [ -z "$pr" ]; then
+            body=$(printf 'Promoção automática de `%s` para `%s`.\n\nCommits incluídos:\n\n%s\n' "$HEAD" "$BASE" \
+              "$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD" --jq '.commits[] | "- " + (.commit.message | split("\n")[0])')")
+            url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$BASE" --head "$HEAD" \
+              --title "release: $HEAD → $BASE" --body "$body")
+            pr=${url##*/}
+          fi
+          gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --auto --merge
