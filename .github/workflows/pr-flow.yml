@@ -73,6 +73,23 @@ jobs:
         with:
           app-id: ${{ inputs.app_id }}
           private-key: ${{ secrets.app_private_key }}
+      - name: Exigir checks obrigatórios na branch de destino
+        if: steps.match.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BASE: ${{ inputs.integration_branch }}
+        # Sem checks obrigatórios, `gh pr merge --auto` faz o merge na hora,
+        # sem esperar o CI. Proteção clássica e rulesets contam.
+        run: |
+          classic=$(gh api "repos/$GITHUB_REPOSITORY/branches/$BASE" \
+            --jq '[.protection.required_status_checks.checks[]?.context, .protection.required_status_checks.contexts[]?] | unique | length' 2>/dev/null || echo 0)
+          rules=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$BASE" \
+            --jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]] | length' 2>/dev/null || echo 0)
+          if [ "${classic:-0}" -eq 0 ] && [ "${rules:-0}" -eq 0 ]; then
+            echo "::error::$BASE não exige nenhum check; o merge automático seria imediato. Configure proteção ou ruleset com checks obrigatórios."
+            exit 1
+          fi
+          echo "$BASE exige checks (proteção: $classic, rulesets: $rules)."
       - name: Ligar merge automático
         if: steps.match.outputs.ok == 'true'
         env:
@@ -103,6 +120,14 @@ jobs:
           BASE: ${{ inputs.promotion_branch }}
           HEAD: ${{ inputs.integration_branch }}
         run: |
+          classic=$(gh api "repos/$GITHUB_REPOSITORY/branches/$BASE" \
+            --jq '[.protection.required_status_checks.checks[]?.context, .protection.required_status_checks.contexts[]?] | unique | length' 2>/dev/null || echo 0)
+          rules=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$BASE" \
+            --jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]] | length' 2>/dev/null || echo 0)
+          if [ "${classic:-0}" -eq 0 ] && [ "${rules:-0}" -eq 0 ]; then
+            echo "::error::$BASE não exige nenhum check; a promoção automática seria imediata."
+            exit 1
+          fi
           ahead=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD" --jq '.ahead_by')
           if [ "$ahead" = "0" ]; then
             echo "$HEAD não tem nada à frente de $BASE."
