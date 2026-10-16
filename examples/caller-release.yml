@@ -1,0 +1,16 @@
+# Copie para .github/workflows/release.yml do repositório.
+# Actions → release → Run workflow sobe a branch validada para produção.
+name: release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  release:
+    uses: andersonflima/pr-automation/.github/workflows/release.yml@v1
+    with:
+      app_id: ${{ vars.AUTOMATION_APP_ID }}
+      validated_branch: homolog
+      production_branch: main
+    secrets:
+      app_private_key: ${{ secrets.AUTOMATION_APP_PRIVATE_KEY }}
