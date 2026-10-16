@@ -1,0 +1,84 @@
+# Release sob demanda: promove a branch validada (ex. homolog) para a de
+# produção (ex. main).
+#
+# Disparado à mão (workflow_dispatch no repositório que chama), nunca a cada
+# push: subir para produção é decisão do dono. Abre (ou reaproveita) o PR
+# validada → produção e liga o merge automático com merge commit, para manter a
+# ancestralidade; o merge só acontece quando os checks obrigatórios da branch de
+# produção passam, e o deploy de produção segue do push na branch de produção.
+#
+# Antes de abrir, recusa se a branch de produção não exige checks (o --auto
+# faria o merge na hora, sem CI) e avisa quando a produção tem commits que não
+# estão na validada: eles entram no merge, mas vale trazê-los de volta para a
+# validada depois, para as duas não divergirem.
+name: release
+
+on:
+  workflow_call:
+    inputs:
+      app_id:
+        description: ID do GitHub App que executa os merges.
+        type: string
+        required: true
+      validated_branch:
+        description: Branch validada que sobe (ex. homolog).
+        type: string
+        default: homolog
+      production_branch:
+        description: Branch de produção (ex. main).
+        type: string
+        default: main
+    secrets:
+      app_private_key:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Token do App
+        id: app
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ inputs.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+      - name: Abrir ou reaproveitar o PR de release e ligar o merge automático
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          BASE: ${{ inputs.production_branch }}
+          HEAD: ${{ inputs.validated_branch }}
+        run: |
+          classic=$(gh api "repos/$GITHUB_REPOSITORY/branches/$BASE" \
+            --jq '[.protection.required_status_checks.checks[]?.context, .protection.required_status_checks.contexts[]?] | unique | length' 2>/dev/null || echo 0)
+          rules=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$BASE" \
+            --jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]] | length' 2>/dev/null || echo 0)
+          if [ "${classic:-0}" -eq 0 ] && [ "${rules:-0}" -eq 0 ]; then
+            echo "::error::$BASE não exige nenhum check; a release iria para produção sem CI. Configure proteção ou ruleset com checks obrigatórios."
+            exit 1
+          fi
+          compare=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD")
+          ahead=$(jq -r '.ahead_by' <<<"$compare")
+          behind=$(jq -r '.behind_by' <<<"$compare")
+          if [ "$ahead" = "0" ]; then
+            echo "$HEAD não tem nada à frente de $BASE; produção já está em dia."
+            exit 0
+          fi
+          if [ "$behind" != "0" ]; then
+            echo "::warning::$BASE tem $behind commit(s) fora de $HEAD; entram no merge, mas traga-os para $HEAD depois."
+          fi
+          pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base "$BASE" --head "$HEAD" --state open --json number --jq '.[0].number')
+          if [ -z "$pr" ]; then
+            body=$(printf 'Release de `%s` para `%s` (produção), disparada por @%s.\n\nCommits incluídos:\n\n%s\n' "$HEAD" "$BASE" "$GITHUB_ACTOR" \
+              "$(jq -r '.commits[] | "- " + (.commit.message | split("\n")[0])' <<<"$compare")")
+            url=$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$BASE" --head "$HEAD" \
+              --title "release: $HEAD → $BASE (produção)" --body "$body")
+            pr=${url##*/}
+          fi
+          gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --auto --merge
+          echo "PR #$pr: merge automático ligado; entra em $BASE quando os checks passarem." >> "$GITHUB_STEP_SUMMARY"

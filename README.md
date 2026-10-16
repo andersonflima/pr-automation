@@ -27,3 +27,10 @@ Os merges usam o token de um GitHub App (`actions/create-github-app-token`), nã
 Para repositórios só com `main`, use `integration_branch: main` e deixe `promotion_branch` vazio.
 
 Para fixar versões, use a tag `v1` (`@v1`).
+
+## Release para produção
+
+`.github/workflows/release.yml` sobe a branch validada (padrão `homolog`) para a de produção (padrão `main`) sob demanda: copie `examples/caller-release.yml` para o repositório e rode **Actions → release → Run workflow**. O workflow abre (ou reaproveita) o PR `homolog → main` e liga o merge automático com merge commit. O merge espera os checks obrigatórios de `main`, e o deploy de produção segue do push em `main`.
+
+- Recusa quando `main` não exige checks, para nunca ir a produção sem CI.
+- Avisa quando `main` tem commits fora de `homolog`: eles entram no merge, mas devem voltar para `homolog`.
