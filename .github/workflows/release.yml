@@ -6,6 +6,8 @@
 # validada → produção e liga o merge automático com merge commit, para manter a
 # ancestralidade; o merge só acontece quando os checks obrigatórios da branch de
 # produção passam, e o deploy de produção segue do push na branch de produção.
+# Quando o SHA já tem os checks verdes (CI do push na validada), o merge é feito
+# direto, com as mesmas regras (veja ARM_MERGE).
 #
 # Antes de abrir, recusa se a branch de produção não exige checks (o --auto
 # faria o merge na hora, sem CI) e avisa quando a produção tem commits que não
@@ -35,9 +37,75 @@ on:
 permissions:
   contents: read
 
+env:
+  # Funções compartilhadas pelos jobs (carregadas com eval).
+  #
+  # require_checks: falha quando a branch não exige nenhum check (proteção
+  # clássica ou ruleset).
+  #
+  # arm_merge: liga o merge automático e confere que ele ficou ligado. Quando o
+  # SHA do PR já tem os checks obrigatórios verdes (o caso de todo PR de
+  # promoção, porque o CI do push na branch de origem roda no mesmo SHA), o
+  # GitHub recusa armar ("Pull request is in clean status") ou tenta o merge na
+  # hora e desarma com "Repository rule violations found" assim que o CI do
+  # pull_request entra pendente. Nesses casos faz o merge direto quando o PR
+  # está CLEAN e volta a armar quando está BLOCKED, até ficar armado e estável
+  # ou mergeado. O App não é bypass: o merge direto também exige os checks.
+  ARM_MERGE: |
+    require_checks() {
+      local base=$1 classic rules
+      classic=$(gh api "repos/$GITHUB_REPOSITORY/branches/$base" \
+        --jq '[.protection.required_status_checks.checks[]?.context, .protection.required_status_checks.contexts[]?] | unique | length' 2>/dev/null || echo 0)
+      rules=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$base" \
+        --jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]] | length' 2>/dev/null || echo 0)
+      if [ "${classic:-0}" -eq 0 ] && [ "${rules:-0}" -eq 0 ]; then
+        echo "::error::$base não exige nenhum check; o merge automático seria imediato, sem CI. Configure proteção ou ruleset com checks obrigatórios."
+        return 1
+      fi
+      echo "$base exige checks (proteção: $classic, rulesets: $rules)."
+    }
+    arm_merge() {
+      local pr=$1 method=$2 tries=${ARM_TRIES:-60} stable=0 info state armed mss out
+      shift 2
+      for _ in $(seq 1 "$tries"); do
+        info=$(gh pr view "$pr" --repo "$GITHUB_REPOSITORY" --json state,autoMergeRequest,mergeStateStatus)
+        state=$(jq -r '.state' <<<"$info")
+        armed=$(jq -r '.autoMergeRequest != null' <<<"$info")
+        mss=$(jq -r '.mergeStateStatus' <<<"$info")
+        case "$state" in
+          MERGED) echo "PR #$pr mergeado."; return 0 ;;
+          CLOSED) echo "::error::PR #$pr foi fechado sem merge."; return 1 ;;
+        esac
+        if [ "$armed" = true ]; then
+          stable=$((stable + 1))
+          if [ "$stable" -ge 3 ]; then
+            echo "PR #$pr: merge automático ligado; entra quando os checks obrigatórios passarem."
+            return 0
+          fi
+        else
+          stable=0
+          case "$mss" in
+            CLEAN|HAS_HOOKS)
+              out=$(gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" "$method" "$@" 2>&1) \
+                || echo "Merge direto recusado por enquanto: $out" ;;
+            DIRTY)
+              echo "::error::PR #$pr tem conflito com a base; resolva para o merge automático seguir."
+              return 1 ;;
+            *)
+              out=$(gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --auto "$method" "$@" 2>&1) \
+                || echo "Merge automático não ligou ainda ($mss): $out" ;;
+          esac
+        fi
+        sleep 10
+      done
+      echo "::error::PR #$pr não ficou com merge automático ligado nem foi mergeado."
+      return 1
+    }
+
 jobs:
   release:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     concurrency:
       group: release-${{ github.repository }}
       cancel-in-progress: false
@@ -54,14 +122,8 @@ jobs:
           BASE: ${{ inputs.production_branch }}
           HEAD: ${{ inputs.validated_branch }}
         run: |
-          classic=$(gh api "repos/$GITHUB_REPOSITORY/branches/$BASE" \
-            --jq '[.protection.required_status_checks.checks[]?.context, .protection.required_status_checks.contexts[]?] | unique | length' 2>/dev/null || echo 0)
-          rules=$(gh api "repos/$GITHUB_REPOSITORY/rules/branches/$BASE" \
-            --jq '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[]] | length' 2>/dev/null || echo 0)
-          if [ "${classic:-0}" -eq 0 ] && [ "${rules:-0}" -eq 0 ]; then
-            echo "::error::$BASE não exige nenhum check; a release iria para produção sem CI. Configure proteção ou ruleset com checks obrigatórios."
-            exit 1
-          fi
+          eval "$ARM_MERGE"
+          require_checks "$BASE"
           compare=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$HEAD")
           ahead=$(jq -r '.ahead_by' <<<"$compare")
           behind=$(jq -r '.behind_by' <<<"$compare")
@@ -80,5 +142,5 @@ jobs:
               --title "release: $HEAD → $BASE (produção)" --body "$body")
             pr=${url##*/}
           fi
-          gh pr merge "$pr" --repo "$GITHUB_REPOSITORY" --auto --merge
-          echo "PR #$pr: merge automático ligado; entra em $BASE quando os checks passarem." >> "$GITHUB_STEP_SUMMARY"
+          arm_merge "$pr" --merge
+          echo "PR #$pr: merge automático ligado (ou já mergeado); entra em $BASE quando os checks obrigatórios passarem." >> "$GITHUB_STEP_SUMMARY"
